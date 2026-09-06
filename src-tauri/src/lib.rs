@@ -1991,25 +1991,6 @@ async fn enabled_proxy_apps_on_startup(db: &database::Database) -> Vec<&'static 
     apps
 }
 
-/// 清除所有应用的接管标志（`proxy_config.enabled`）。
-///
-/// 「开机自动恢复路由接管」关闭时在启动阶段调用：崩溃恢复已经把 Live 配置
-/// 恢复为原始内容，这里再把残留的接管标志清掉，使本次及后续启动都不会
-/// 自动重新接管，客户端配置不再指向失效的路由地址。
-async fn clear_enabled_proxy_apps_for_startup(db: &database::Database) {
-    for app_type in PROXY_STARTUP_APP_TYPES {
-        if let Ok(mut config) = db.get_proxy_config_for_app(app_type).await {
-            if config.enabled {
-                config.enabled = false;
-                if let Err(e) = db.update_proxy_config_for_app(config).await {
-                    log::warn!("清除 {app_type} 接管标志失败: {e}");
-                }
-            }
-        }
-    }
-    let _ = db.set_live_takeover_active(false).await;
-}
-
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
     let apps_to_restore = enabled_proxy_apps_on_startup(&state.db).await;
@@ -2023,7 +2004,7 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
     // 这里只清掉残留标志，不重新接管。
     if !crate::settings::get_settings().proxy_restore_on_startup {
         log::info!("开机自动恢复路由接管已关闭，清除残留接管标志，保持 Live 为原始配置");
-        clear_enabled_proxy_apps_for_startup(&state.db).await;
+        state.proxy_service.clear_stale_takeover_flags().await;
         return;
     }
 
@@ -2339,9 +2320,9 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_exit_request, clear_enabled_proxy_apps_for_startup, enabled_proxy_apps_on_startup,
-        redact_url_for_log, redact_url_for_log_with_secrets, redact_url_origin_for_log,
-        runtime_log_level_allows, ExitRequestAction,
+        classify_exit_request, enabled_proxy_apps_on_startup, redact_url_for_log,
+        redact_url_for_log_with_secrets, redact_url_origin_for_log, runtime_log_level_allows,
+        ExitRequestAction,
     };
     use crate::database::Database;
 
@@ -2466,46 +2447,5 @@ mod tests {
         let apps = enabled_proxy_apps_on_startup(&db).await;
 
         assert_eq!(apps, vec!["grokbuild"]);
-    }
-
-    #[tokio::test]
-    async fn clear_enabled_proxy_apps_for_startup_clears_all_flags() {
-        let db = Database::memory().expect("initialize database");
-        for app_type in ["claude", "grokbuild"] {
-            let mut config = db
-                .get_proxy_config_for_app(app_type)
-                .await
-                .expect("read proxy config");
-            config.enabled = true;
-            db.update_proxy_config_for_app(config)
-                .await
-                .expect("enable proxy config");
-        }
-        db.set_live_takeover_active(true)
-            .await
-            .expect("set takeover flag");
-
-        clear_enabled_proxy_apps_for_startup(&db).await;
-
-        assert!(
-            enabled_proxy_apps_on_startup(&db).await.is_empty(),
-            "all enabled flags should be cleared"
-        );
-        for app_type in ["claude", "grokbuild"] {
-            let config = db
-                .get_proxy_config_for_app(app_type)
-                .await
-                .expect("read proxy config");
-            assert!(
-                !config.enabled,
-                "{app_type} enabled flag should be false after clearing"
-            );
-        }
-        assert!(
-            !db.is_live_takeover_active()
-                .await
-                .expect("read takeover flag"),
-            "legacy takeover flag should be cleared"
-        );
     }
 }
